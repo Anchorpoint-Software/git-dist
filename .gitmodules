@@ -1,0 +1,4 @@
+[submodule "third_party/git-lfs"]
+	path = third_party/git-lfs
+	url = https://github.com/Anchorpoint-Software/git-lfs
+	branch = ap-release-3.7

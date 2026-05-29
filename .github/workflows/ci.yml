@@ -1,0 +1,44 @@
+name: ci
+
+# Compile-checks only. The full signed Git distribution is built and published
+# locally per platform (Windows code-signing uses a short-lived ~3h token that
+# can't live in CI) -- see README "Releasing". CI just catches fork/build breakage.
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build-git-lfs:
+    strategy:
+      matrix:
+        include:
+          - { goos: windows, goarch: amd64 }
+          - { goos: darwin, goarch: arm64 }
+          - { goos: darwin, goarch: amd64 }
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+          # PAT with read access to the private git-lfs fork.
+          token: ${{ secrets.SUBMODULE_TOKEN }}
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: third_party/git-lfs/go.mod
+      - name: Compile git-lfs (${{ matrix.goos }}/${{ matrix.goarch }})
+        working-directory: third_party/git-lfs
+        env:
+          GOOS: ${{ matrix.goos }}
+          GOARCH: ${{ matrix.goarch }}
+        run: go build -trimpath -ldflags="-s -w" -o /tmp/git-lfs .
+
+  lint-build-script:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: python -m py_compile build.py

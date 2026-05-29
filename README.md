@@ -28,7 +28,7 @@ Each is a self-contained Git tree with the fork's `git-lfs` in
 build.py             # git + fork git-lfs -> dist/<asset>/ -> zip + .sha256
 config.example.ini   # copy to config.ini; host-specific SDK / source paths
 third_party/git-lfs/ # submodule -> the git-lfs fork
-.github/workflows/release.yml
+.github/workflows/ci.yml   # compile-checks the fork (no sign/publish)
 ```
 
 ## Build
@@ -52,14 +52,34 @@ a `git/git` source checkout at the target tag.
 
 ## Releasing
 
-Push a tag `v<gitversion>-<build>` (e.g. `v2.47.0-1` — the bundled Git version
-plus an Anchorpoint build number). CI builds all targets, signs/notarizes, and
-creates the release with the archives + checksums. Consumers pin a tag and
-verify the `.sha256`.
+Releases are built and signed **locally** — Windows code-signing uses a
+short-lived (~3h) token that can't live in CI. Build each platform on its own
+machine and publish to a shared tag with `--publish` (needs the `gh` CLI
+authenticated with write access here):
 
-> CI needs three things as secrets / build-host setup: a token for the private
-> `git-lfs` submodule, the `anchorpoint` MinGit flavor, and the
-> signing/notarization credentials — see `release.yml`.
+```sh
+# Windows, with the signing token in the environment:
+python build.py --package --publish v2.47.0.anchorpoint.1
+
+# macOS — Apple Silicon, then Intel:
+python build.py --package --arch arm64  --publish v2.47.0.anchorpoint.1
+python build.py --package --arch x86_64 --publish v2.47.0.anchorpoint.1
+```
+
+Tag scheme `v<gitversion>.anchorpoint.<n>` (e.g. `v2.47.0.anchorpoint.1`), like
+Git for Windows' `.windows.N` — the upstream Git version plus an Anchorpoint
+build number; bump `.anchorpoint.<n>` when you re-cut the same Git version (e.g.
+a `git-lfs` fork or gitconfig change), with the exact fork commit in the release
+notes. `--publish` creates the release for the tag
+if it doesn't exist, then uploads this machine's archives (clobbering a prior
+upload of the same name), so each host adds its assets to the same release.
+macOS notarization (`xcrun notarytool submit dist/<asset>.zip --wait`, then
+staple) runs on the Mac before publishing. Consumers pin a tag and verify the
+`.sha256`.
+
+CI (`.github/workflows/ci.yml`) only compile-checks the `git-lfs` fork across
+targets — it does not sign or publish. It needs `SUBMODULE_TOKEN` (read access
+to the private fork) to clone the submodule.
 
 ## Licensing
 

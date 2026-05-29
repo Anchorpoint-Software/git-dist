@@ -6,3 +6,7 @@ build-temp/
 dist/
 *.zip
 *.sha256
+
+# Python bytecode
+__pycache__/
+*.pyc
