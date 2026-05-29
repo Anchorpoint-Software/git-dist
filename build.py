@@ -15,10 +15,13 @@ gitignored dist/ instead of committed trees, packaging is built in, and the
 git-lfs fork defaults to the bundled third_party/git-lfs submodule.
 
 Usage:
-    python build.py [--package] [--nosign] [--arch arm64|x86_64]
+    python build.py [--package] [--nosign] [--publish] [--arch arm64|x86_64]
+    release.ps1                  # Windows: verify SimplySign, then build+sign+publish
 
 Paths come from config.ini (copy config.example.ini) or env vars
-GIT_SDK_PATH / GIT_LFS_PATH / GIT_SOURCE_PATH (env wins).
+GIT_SDK_PATH / GIT_LFS_PATH / GIT_SOURCE_PATH (env wins). On Windows the SDK's
+git/build-extra sources are auto-initialized on first build, and signing
+defaults to ./sign-windows.ps1.
 """
 from __future__ import annotations
 
@@ -102,27 +105,48 @@ def build_gitlfs(gitlfs: str, dest: str, goos: str, goarch: str) -> None:
 # --------------------------------------------------------------------------- #
 # Git (Windows: MinGit via Git SDK)
 # --------------------------------------------------------------------------- #
+def ensure_sdk_sources(gitsdk: str) -> None:
+    """Fetch + checkout the SDK's git and build-extra sources if not yet present.
+
+    git-sdk-64 ships usr/src/git and usr/src/build-extra as repos with their
+    remote configured but no working tree (`sdk init` normally populates them).
+    Do it here with plain git (shallow main) so a freshly-unpacked SDK builds
+    without any manual steps.
+    """
+    for rel in ("usr/src/git", "usr/src/build-extra"):
+        repo = os.path.join(gitsdk, rel)
+        if not os.path.exists(os.path.join(repo, ".git")):
+            raise SystemExit(
+                f"[git-dist] {rel} is not a git repo under {gitsdk}; "
+                "reinstall the Git for Windows SDK."
+            )
+        if _capture(["git", "-C", repo, "rev-parse", "--verify", "HEAD"]).strip():
+            continue  # already checked out
+        print(f"[git-dist] initializing SDK source: {rel}")
+        if _run(["git", "-C", repo, "fetch", "--depth=1", "origin",
+                 "+refs/heads/main:refs/remotes/origin/main"]) != 0:
+            raise SystemExit(f"[git-dist] failed to fetch {rel}")
+        if _run(["git", "-C", repo, "checkout", "-B", "main", "origin/main"]) != 0:
+            raise SystemExit(f"[git-dist] failed to checkout {rel}")
+
+
 def build_git_windows(gitsdk: str, dest: str) -> None:
-    src_git = os.path.join(gitsdk, "usr/src/git")
-    build_extra = os.path.join(gitsdk, "usr/src/build-extra")
-    if not os.path.exists(src_git) or not os.path.exists(build_extra):
-        raise SystemExit(
-            f"[git-dist] Git SDK not initialized. Open {gitsdk}/git-bash.exe and run "
-            "'sdk cd git && sdk init git' and 'sdk cd build-extra && sdk init build-extra'."
-        )
+    ensure_sdk_sources(gitsdk)
 
     print("Building Git (Windows)")
     os.environ["PATH"] = f"{gitsdk}/usr/bin;{os.environ['PATH']}"
-    if _run_shell(
-        f'{gitsdk}/git-bash.exe -c \'cd {gitsdk}/usr/src/git; '
-        f'make install CFLAGS="-O3 -DNDEBUG -Wno-error"\''
+    if _sdk_bash(
+        gitsdk,
+        'cd /usr/src/git && make install CFLAGS="-O3 -DNDEBUG -Wno-error"',
     ) != 0:
         raise SystemExit("[git-dist] git build failed")
 
     print("Building MinGit (anchorpoint flavor)")
-    if _run_shell(
-        f"{gitsdk}/git-bash.exe -c 'cd {gitsdk}/usr/src/build-extra/mingit; "
-        f"sh release.sh --output={gitsdk}/usr/src/build-extra/build anchorpoint'"
+    if _sdk_bash(
+        gitsdk,
+        "mkdir -p /usr/src/build-extra/build && "
+        "cd /usr/src/build-extra/mingit && "
+        "sh release.sh --output=/usr/src/build-extra/build anchorpoint",
     ) != 0:
         raise SystemExit("[git-dist] MinGit build failed")
 
@@ -134,6 +158,30 @@ def build_git_windows(gitsdk: str, dest: str) -> None:
     print("Extracting MinGit")
     with zipfile.ZipFile(zip_path) as zf:
         zf.extractall(dest)
+
+
+def bundle_less(gitsdk: str, dest: str) -> None:
+    """Bundle the `less` pager (MinGit omits it) so git can page output.
+
+    less.exe needs three MSYS runtime DLLs; msys-2.0.dll and msys-ncursesw6.dll
+    already ship in MinGit, so only msys-pcre2-8-0.dll is added. The terminfo
+    database is copied too so ncurses can read terminal capabilities. git's
+    default pager is `less`; Anchorpoint disables paging per call with `git -P`
+    for programmatic (captured) output so it never blocks on the pager.
+    """
+    usr_bin_src = os.path.join(gitsdk, "usr", "bin")
+    usr_bin_dst = os.path.join(dest, "usr", "bin")
+    os.makedirs(usr_bin_dst, exist_ok=True)
+    for name in ("less.exe", "msys-pcre2-8-0.dll"):
+        src = os.path.join(usr_bin_src, name)
+        if not os.path.exists(src):
+            raise SystemExit(f"[git-dist] cannot bundle pager: missing {src}")
+        shutil.copy2(src, os.path.join(usr_bin_dst, name))
+    terminfo_src = os.path.join(gitsdk, "usr", "share", "terminfo")
+    terminfo_dst = os.path.join(dest, "usr", "share", "terminfo")
+    if os.path.isdir(terminfo_src):
+        shutil.copytree(terminfo_src, terminfo_dst, dirs_exist_ok=True)
+    print("Bundled less pager + terminfo")
 
 
 # --------------------------------------------------------------------------- #
@@ -175,9 +223,12 @@ DESTDIR="{dest}" make strip install prefix=/ \\
 def prune_programs(dest: str) -> None:
     for rel in PRUNE_PROGRAMS:
         for base in (dest, os.path.join(dest, "mingw64")):
-            p = os.path.join(base, rel)
-            if os.path.exists(p):
-                os.remove(p)
+            # On Windows these are .exe; PRUNE_PROGRAMS lists the bare names so
+            # the same list works for macOS. Try both so the server-side
+            # programs are actually removed on Windows too.
+            for p in (os.path.join(base, rel), os.path.join(base, rel) + ".exe"):
+                if os.path.exists(p):
+                    os.remove(p)
 
 
 def patch_git_config(dest: str) -> None:
@@ -232,11 +283,14 @@ def sign(dest: str) -> None:
             ])
         print("macOS signing complete (notarization happens in CI after packaging)")
     elif platform.system() == "Windows":
-        script = os.environ.get("WINDOWS_SIGN_SCRIPT")
-        if not script or not os.path.exists(script):
-            print("[git-dist] WARNING: WINDOWS_SIGN_SCRIPT unset — skipping signing")
+        script = os.environ.get("WINDOWS_SIGN_SCRIPT") or os.path.join(ROOT, "sign-windows.ps1")
+        if not os.path.exists(script):
+            print(f"[git-dist] WARNING: sign script not found ({script}) — skipping signing")
             return
-        _run_shell(f'powershell -File "{script}" -folderPath "{dest}"')
+        _run_shell(
+            f'powershell -NoProfile -ExecutionPolicy Bypass -File "{script}" '
+            f'-folderPath "{dest}"'
+        )
         print("Windows signing complete")
 
 
@@ -256,7 +310,9 @@ def package(dest: str, asset_name: str) -> None:
                 arc = os.path.relpath(abs_path, dest)
                 zf.write(abs_path, arc)
     digest = _sha256(zip_path)
-    with open(zip_path + ".sha256", "w") as f:
+    # newline="\n": keep an LF-only sidecar so `sha256sum -c` works for consumers
+    # (text mode would write CRLF on Windows and break filename matching).
+    with open(zip_path + ".sha256", "w", newline="\n") as f:
         f.write(f"{digest}  {asset_name}.zip\n")
     print(f"sha256 {digest}")
 
@@ -403,6 +459,49 @@ def _run_shell(cmd: str) -> int:
     return os.system(cmd)
 
 
+def _sdk_bash(gitsdk: str, script: str) -> int:
+    """Run a script in the SDK's MSYS2/MINGW64 login shell, synchronously.
+
+    git-bash.exe is a detached launcher (it returns before the command finishes
+    and sends output to a separate window), so it can't be driven from a build
+    script. bash.exe -lc runs in-process under MSYSTEM=MINGW64 and returns the
+    real exit code. MSYS paths (/usr/src/...) resolve under the SDK root.
+
+    The MinGW toolchain needs a writable temp dir. The SDK's /etc/profile keeps
+    TMP/TEMP from the Windows environment but does not default them, so in a
+    headless/CI shell (where Windows provides none) they stay empty and the
+    tools fall back to C:\\Windows and fail. Export them *inside* the script
+    (i.e. after profile has run) so they point at a writable directory. Child
+    output is streamed through this process so it lands in our logs.
+    """
+    import subprocess
+    bash = os.path.join(gitsdk, "usr", "bin", "bash.exe")
+    tmp = os.path.join(ROOT, "build-temp", "tmp")
+    os.makedirs(tmp, exist_ok=True)
+    tmp_msys = tmp.replace("\\", "/")
+    script = f'export TMP="{tmp_msys}" TEMP="{tmp_msys}" TMPDIR="{tmp_msys}"; {script}'
+    env = os.environ.copy()
+    env["MSYSTEM"] = "MINGW64"
+    env["CHERE_INVOKING"] = "1"
+    # A build shell is non-interactive; scripts like MinGit's release.sh drive
+    # the editor themselves (`-c core.editor=echo`) to read paths back. An
+    # inherited GIT_EDITOR/EDITOR/VISUAL (e.g. GIT_EDITOR=true in CI) overrides
+    # that and makes them return nothing, so drop them.
+    for _var in ("GIT_EDITOR", "EDITOR", "VISUAL"):
+        env.pop(_var, None)
+    kwargs = {}
+    if platform.system() == "Windows":
+        kwargs["creationflags"] = 0x08000000  # CREATE_NO_WINDOW
+    proc = subprocess.Popen(
+        [bash, "-lc", script], env=env, stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT, text=True, bufsize=1, **kwargs,
+    )
+    for line in proc.stdout:
+        print(line, end="", flush=True)
+    proc.wait()
+    return proc.returncode
+
+
 # --------------------------------------------------------------------------- #
 # Entry
 # --------------------------------------------------------------------------- #
@@ -421,6 +520,12 @@ def main() -> None:
     args = parser.parse_args()
 
     config = load_config()
+    # Windows signing config -> env (an explicit env var still wins). sign()
+    # reads these; sign_script defaults to ./sign-windows.ps1 when unset.
+    for opt, var in (("sign_script", "WINDOWS_SIGN_SCRIPT"),
+                     ("sign_thumbprint", "WINDOWS_SIGN_THUMBPRINT")):
+        if config.has_option("windows", opt):
+            os.environ.setdefault(var, config["windows"][opt])
     gitlfs = resolve_path(config, "gitlfs", "GIT_LFS_PATH", required=True)
     arch = args.arch or ("arm64" if platform.machine() in ("arm64", "aarch64") else "x86_64")
     asset = asset_name_for(arch)
@@ -430,6 +535,7 @@ def main() -> None:
         gitsdk = resolve_path(config, "gitsdk", "GIT_SDK_PATH", required=True)
         build_git_windows(gitsdk, dest)
         build_gitlfs(gitlfs, dest, goos="windows", goarch="amd64")
+        bundle_less(gitsdk, dest)
     elif platform.system() == "Darwin":
         git_source = resolve_path(config, "gitsource", "GIT_SOURCE_PATH", required=True)
         build_git_macos(git_source, dest, arch)
