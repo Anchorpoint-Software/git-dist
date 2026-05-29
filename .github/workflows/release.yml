@@ -1,0 +1,125 @@
+name: release
+
+# Build portable Git + the Anchorpoint git-lfs fork for every target and publish
+# the archives as GitHub release assets.
+#
+# Triggers on a version tag (v<gitversion>-ap.<n>, e.g. v2.47.0-ap.1) or manually.
+#
+# SCAFFOLD: three pieces are host/secret-specific and must be supplied before a
+# release will produce signed assets — each is marked "TODO" below:
+#   1. SUBMODULE_TOKEN  — PAT with read access to the private git-lfs fork
+#   2. the `anchorpoint` MinGit flavor in the Windows Git SDK
+#   3. macOS Developer ID + notarization creds, and the Windows signing cert
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+env:
+  # Git version whose source macOS builds from. Keep in sync with the tag's
+  # <gitversion> and with the Windows SDK's git tree.
+  GIT_VERSION: "2.47.0"
+
+jobs:
+  build-windows:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+          # TODO: PAT (repo:read on Anchorpoint-Software/git-lfs) so the private
+          # submodule can be cloned. Falls back to GITHUB_TOKEN, which cannot see
+          # the private fork.
+          token: ${{ secrets.SUBMODULE_TOKEN }}
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: third_party/git-lfs/go.mod
+
+      - name: Set up Git for Windows SDK
+        uses: git-for-windows/setup-git-for-windows-sdk@v1
+
+      # TODO: install the `anchorpoint` MinGit flavor into the SDK's build-extra
+      # (usr/src/build-extra/mingit/) before building. Without it, release.sh
+      # has no `anchorpoint` flavor to produce MinGit-anchorpoint-64-bit.zip.
+      - name: Install anchorpoint MinGit flavor
+        run: echo "TODO: add usr/src/build-extra/mingit/anchorpoint flavor"
+
+      - name: Build + package
+        env:
+          GIT_LFS_PATH: third_party/git-lfs
+          # TODO: WINDOWS_SIGN_SCRIPT: path to the code-signing PowerShell script
+        run: python build.py --package
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: git-windows-x64
+          path: |
+            dist/git-windows-x64.zip
+            dist/git-windows-x64.zip.sha256
+
+  build-macos:
+    strategy:
+      matrix:
+        include:
+          - arch: arm64
+            runner: macos-14
+          - arch: x86_64
+            runner: macos-13
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+          token: ${{ secrets.SUBMODULE_TOKEN }}
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: third_party/git-lfs/go.mod
+
+      - name: Fetch git source
+        run: |
+          git clone --depth 1 --branch "v${GIT_VERSION}" https://github.com/git/git "$RUNNER_TEMP/git-src"
+
+      # TODO: import the macOS Developer ID cert into a temporary keychain from
+      # secrets (MACOS_CERT_P12 / MACOS_CERT_PASSWORD) before building so codesign
+      # can find MACOS_SIGN_IDENTITY.
+      - name: Build + package
+        env:
+          GIT_LFS_PATH: third_party/git-lfs
+          GIT_SOURCE_PATH: ${{ runner.temp }}/git-src
+          MACOS_SIGN_IDENTITY: ${{ secrets.MACOS_SIGN_IDENTITY }}
+        run: python build.py --package --arch ${{ matrix.arch }}
+
+      # TODO: notarize + staple dist/*.zip (xcrun notarytool submit --wait) using
+      # secrets.MACOS_NOTARY_* before upload.
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: git-macos-${{ matrix.arch == 'arm64' && 'arm64' || 'x64' }}
+          path: |
+            dist/git-macos-*.zip
+            dist/git-macos-*.zip.sha256
+
+  release:
+    needs: [build-windows, build-macos]
+    if: startsWith(github.ref, 'refs/tags/')
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+          merge-multiple: true
+
+      - name: Create release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "${GITHUB_REF_NAME}" \
+            --repo "${GITHUB_REPOSITORY}" \
+            --title "${GITHUB_REF_NAME}" \
+            --notes "Portable Git ${GIT_VERSION} + Anchorpoint git-lfs fork." \
+            artifacts/*.zip artifacts/*.zip.sha256
