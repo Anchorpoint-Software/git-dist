@@ -59,22 +59,24 @@ authenticated with write access here):
 
 ```sh
 # Windows, with the signing token in the environment:
-python build.py --package --publish v2.47.0.anchorpoint.1
+python build.py --package --publish
 
-# macOS — Apple Silicon, then Intel:
-python build.py --package --arch arm64  --publish v2.47.0.anchorpoint.1
-python build.py --package --arch x86_64 --publish v2.47.0.anchorpoint.1
+# macOS — Apple Silicon, then Intel (notarytool leaves the bytes unchanged):
+python build.py --package --arch arm64  --publish
+xcrun notarytool submit dist/git-macos-arm64.zip --keychain-profile <profile> --wait
+python build.py --package --arch x86_64 --publish
+xcrun notarytool submit dist/git-macos-x64.zip --keychain-profile <profile> --wait
 ```
 
-Tag scheme `v<gitversion>.anchorpoint.<n>` (e.g. `v2.47.0.anchorpoint.1`), like
-Git for Windows' `.windows.N` — the upstream Git version plus an Anchorpoint
-build number; bump `.anchorpoint.<n>` when you re-cut the same Git version (e.g.
-a `git-lfs` fork or gitconfig change), with the exact fork commit in the release
-notes. `--publish` creates the release for the tag
-if it doesn't exist, then uploads this machine's archives (clobbering a prior
-upload of the same name), so each host adds its assets to the same release.
-macOS notarization (`xcrun notarytool submit dist/<asset>.zip --wait`, then
-staple) runs on the Mac before publishing. Consumers pin a tag and verify the
+`--publish` auto-derives the tag `v<gitversion>.anchorpoint.<n>` (GfW-style, like
+Git for Windows' `.windows.N`) from the Git version it just built: it reuses the
+highest existing `…anchorpoint.<n>` for that Git version, or starts at `.1`. So
+the first machine creates `…anchorpoint.1` and the others upload into the *same*
+release (clobbering a prior upload of the same name) — all three archives land on
+one tag. To re-cut the same Git version (e.g. a `git-lfs` fork or gitconfig
+change), run the first machine with `--bump` (→ `…anchorpoint.2`) and the rest
+plain `--publish`; override entirely with `--tag v2.47.0.anchorpoint.3`. Record
+the exact fork commit in the release notes; consumers pin a tag and verify the
 `.sha256`.
 
 CI (`.github/workflows/ci.yml`) only compile-checks the `git-lfs` fork across

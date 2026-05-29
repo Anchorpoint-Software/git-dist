@@ -264,6 +264,56 @@ def package(dest: str, asset_name: str) -> None:
 # --------------------------------------------------------------------------- #
 # Publishing (local: each build host uploads its own assets to the shared tag)
 # --------------------------------------------------------------------------- #
+def built_git_version(dest: str) -> str:
+    """Read the upstream Git version (e.g. "2.47.0") from the freshly-built git."""
+    candidates = [
+        os.path.join(dest, "cmd", "git.exe"),
+        os.path.join(dest, "mingw64", "bin", "git.exe"),
+        os.path.join(dest, "bin", "git"),
+    ]
+    gitbin = next((c for c in candidates if os.path.exists(c)), None)
+    if not gitbin:
+        raise SystemExit("[git-dist] cannot find built git to derive the version")
+    out = _capture([gitbin, "--version"])  # "git version 2.47.0[.windows.1]"
+    token = out.split()[-1] if out.split() else ""
+    nums = []
+    for part in token.split("."):
+        if part.isdigit():
+            nums.append(part)
+        else:
+            break
+    if len(nums) < 3:
+        raise SystemExit(f"[git-dist] could not parse git version from {out!r}")
+    return ".".join(nums[:3])
+
+
+def compute_tag(dest: str, bump: bool) -> str:
+    """Auto-derive v<gitver>.anchorpoint.<n> (GfW-style).  <n> reuses the highest
+    existing build for this Git version, or starts at 1; `bump` forces a new
+    number for a re-cut of the same Git version."""
+    gitver = built_git_version(dest)
+    base = f"v{gitver}.anchorpoint"
+    out = _capture([
+        "gh", "release", "list", "--limit", "200",
+        "--json", "tagName", "--jq", ".[].tagName",
+    ])
+    prefix = base + "."
+    existing = sorted(
+        int(line[len(prefix):])
+        for line in out.splitlines()
+        if line.startswith(prefix) and line[len(prefix):].isdigit()
+    )
+    if not existing:
+        n = 1
+    elif bump:
+        n = existing[-1] + 1
+    else:
+        n = existing[-1]
+    tag = f"{base}.{n}"
+    print(f"[git-dist] auto tag: {tag} (git {gitver}; existing builds: {existing or 'none'})")
+    return tag
+
+
 def publish(tag: str, asset: str) -> None:
     files = [
         os.path.join(ROOT, "dist", f"{asset}.zip"),
@@ -336,6 +386,19 @@ def _run(args, cwd=None, env=None) -> int:
     return subprocess.call(args, cwd=cwd, env=env, **kwargs)
 
 
+def _capture(args, cwd=None) -> str:
+    import subprocess
+    kwargs = {}
+    if platform.system() == "Windows":
+        kwargs["creationflags"] = 0x08000000  # CREATE_NO_WINDOW
+    try:
+        return subprocess.check_output(
+            args, cwd=cwd, text=True, stderr=subprocess.DEVNULL, **kwargs
+        )
+    except Exception:
+        return ""
+
+
 def _run_shell(cmd: str) -> int:
     return os.system(cmd)
 
@@ -349,8 +412,12 @@ def main() -> None:
     parser.add_argument("--nosign", action="store_true", help="skip code signing")
     parser.add_argument("--arch", choices=["arm64", "x86_64"], default=None,
                         help="macOS target arch (defaults to host)")
-    parser.add_argument("--publish", metavar="TAG", default=None,
-                        help="after --package, create/upload the GitHub release TAG via gh")
+    parser.add_argument("--publish", action="store_true",
+                        help="after --package, create/upload the GitHub release via gh (auto-tagged)")
+    parser.add_argument("--tag", default=None,
+                        help="explicit release tag (default: auto v<gitver>.anchorpoint.<n>)")
+    parser.add_argument("--bump", action="store_true",
+                        help="with auto-tag, start a new build number for this git version (re-cut)")
     args = parser.parse_args()
 
     config = load_config()
@@ -379,7 +446,8 @@ def main() -> None:
     if args.publish:
         if not args.package:
             raise SystemExit("[git-dist] --publish requires --package")
-        publish(args.publish, asset)
+        tag = args.tag or compute_tag(dest, args.bump)
+        publish(tag, asset)
     print(f"[git-dist] done -> {dest}")
 
 
