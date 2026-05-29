@@ -26,7 +26,9 @@ Each is a self-contained Git tree with the fork's `git-lfs` in
 
 ```
 build.py             # git + fork git-lfs -> dist/<asset>/ -> zip + .sha256
-config.example.ini   # copy to config.ini; host-specific SDK / source paths
+release.ps1          # Windows one-command release (checks SimplySign, runs build.py)
+sign-windows.ps1     # signs the dist's .exe/.dll via signtool (SimplySign cert)
+config.example.ini   # copy to config.ini; host-specific paths + signing
 third_party/git-lfs/ # submodule -> the git-lfs fork
 .github/workflows/ci.yml   # compile-checks the fork (no sign/publish)
 ```
@@ -36,19 +38,32 @@ third_party/git-lfs/ # submodule -> the git-lfs fork
 Clone with submodules (`git clone --recurse-submodules ...`), then:
 
 ```sh
-cp config.example.ini config.ini   # edit the paths
-python build.py --package          # --nosign to skip signing
+cp config.example.ini config.ini   # set the SDK path (Windows) / source path (macOS)
+python build.py --package          # add --nosign to skip signing
 python build.py --package --arch x86_64   # macOS: cross-build Intel
 ```
 
 Output: `dist/<asset>/` plus `dist/<asset>.zip` + `.sha256`. Paths may instead
 come from `GIT_SDK_PATH` / `GIT_LFS_PATH` / `GIT_SOURCE_PATH` (env wins over
-`config.ini`). Signing is env-driven and a no-op when unset
-(`MACOS_SIGN_IDENTITY`, `WINDOWS_SIGN_SCRIPT`).
+`config.ini`). On Windows the SDK's `git`/`build-extra` sources are
+auto-initialized on the first build, the `less` pager is bundled, and signing
+defaults to `./sign-windows.ps1`.
 
-**Prerequisites:** Go (per the fork's `go.mod`); on Windows the Git for Windows
-SDK with the `anchorpoint` MinGit flavor; on macOS Xcode command-line tools and
-a `git/git` source checkout at the target tag.
+### First-time host setup
+
+One-time per machine (not per release):
+
+- **Windows** — install [Go](https://go.dev/dl/), the Git for Windows SDK
+  (`git-sdk-64`), the Windows SDK (for `signtool`), and SimplySign Desktop. Copy
+  `config.example.ini` to `config.ini` and set `[gitsdk].path`; the Git and
+  build-extra sources are fetched automatically on the first build.
+- **macOS** — install Go and Xcode command-line tools, and check out `git/git`
+  at the target tag; set `[gitsource].path`.
+
+Signing is config/env-driven and a no-op when unset: macOS uses
+`MACOS_SIGN_IDENTITY`; Windows uses `sign-windows.ps1` with the
+`[windows].sign_thumbprint` cert (overridable via `WINDOWS_SIGN_SCRIPT` /
+`WINDOWS_SIGN_THUMBPRINT`).
 
 ## Releasing
 
@@ -58,8 +73,9 @@ machine and publish to a shared tag with `--publish` (needs the `gh` CLI
 authenticated with write access here):
 
 ```sh
-# Windows, with the signing token in the environment:
-python build.py --package --publish
+# Windows — log into SimplySign Desktop first, then one command does it all
+# (verifies the cert, builds, signs, packages, and publishes the release):
+.\release.ps1                      # == python build.py --package --publish
 
 # macOS — Apple Silicon, then Intel (notarytool leaves the bytes unchanged):
 python build.py --package --arch arm64  --publish
