@@ -1,0 +1,8 @@
+# Local build config (host-specific paths to the Git SDK / git source)
+config.ini
+
+# Build scratch and outputs — release archives are published, never committed
+build-temp/
+dist/
+*.zip
+*.sha256
