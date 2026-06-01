@@ -193,6 +193,12 @@ def build_git_macos(git_source: str, dest: str, arch: str) -> None:
     print(f"Building Git for macOS ({host_cpu})")
 
     _run(["make", "clean"], cwd=git_source)
+    # RUNTIME_PREFIX: resolve gitexecdir/templates relative to the binary at
+    # runtime (via _NSGetExecutablePath, auto-enabled for Darwin in
+    # config.mak.uname) instead of baking in the absolute prefix=/ path. Without
+    # it the portable dist reports a fixed //libexec/git-core and can't locate
+    # its own git-core once extracted anywhere but /. MinGit always builds with
+    # RUNTIME_PREFIX, which is why the Windows asset is already relocatable.
     script = f"""#!/bin/bash
 set -e
 unset LIBRARY_PATH CPATH PKG_CONFIG_PATH
@@ -206,6 +212,7 @@ DESTDIR="{dest}" make strip install prefix=/ \\
   CURL_CONFIG=/usr/bin/curl-config \\
   NO_PERL=1 NO_TCLTK=1 NO_GETTEXT=1 NO_DARWIN_PORTS=1 \\
   NO_INSTALL_HARDLINKS=1 \\
+  RUNTIME_PREFIX=YesPlease \\
   MACOSX_DEPLOYMENT_TARGET={MACOSX_DEPLOYMENT_TARGET}
 """
     script_path = os.path.join(ROOT, "build-temp", "git_build.sh")
