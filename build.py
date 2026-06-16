@@ -200,6 +200,14 @@ def build_git_macos(git_source: str, dest: str, arch: str) -> None:
     # it the portable dist reports a fixed //libexec/git-core and can't locate
     # its own git-core once extracted anywhere but /. MinGit always builds with
     # RUNTIME_PREFIX, which is why the Windows asset is already relocatable.
+    #
+    # SKIP_DASHED_BUILT_INS: don't install the ~145 dashed builtin aliases
+    # (git-add, git-commit, ...) in libexec/git-core -- they're redundant copies
+    # of the git binary (it dispatches builtins internally; callers only ever use
+    # `git <cmd>`). Tauri's resource bundler dereferences symlinks, so shipping
+    # them re-explodes into ~500 MB of copies inside the .app; omitting them keeps
+    # git-core to its ~31 real helper programs (git-http-fetch, git-remote-https,
+    # git-lfs, ...).
     script = f"""#!/bin/bash
 set -e
 unset LIBRARY_PATH CPATH PKG_CONFIG_PATH
@@ -213,6 +221,7 @@ DESTDIR="{dest}" make strip install prefix=/ \\
   CURL_CONFIG=/usr/bin/curl-config \\
   NO_PERL=1 NO_TCLTK=1 NO_GETTEXT=1 NO_DARWIN_PORTS=1 \\
   NO_INSTALL_HARDLINKS=1 \\
+  SKIP_DASHED_BUILT_INS=YesPlease \\
   RUNTIME_PREFIX=YesPlease \\
   MACOSX_DEPLOYMENT_TARGET={MACOSX_DEPLOYMENT_TARGET}
 """
