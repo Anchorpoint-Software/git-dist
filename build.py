@@ -31,6 +31,7 @@ import hashlib
 import os
 import platform
 import shutil
+import stat
 import zipfile
 
 ROOT = os.path.dirname(os.path.realpath(__file__))
@@ -304,6 +305,16 @@ def sign(dest: str) -> None:
 # --------------------------------------------------------------------------- #
 # Packaging
 # --------------------------------------------------------------------------- #
+def _zip_symlink(zf, abs_path: str, arc: str) -> None:
+    """Record a symlink in the zip as a real symlink (not its dereferenced
+    target). The Unix create_system + S_IFLNK mode bit is what bsdtar/unzip read
+    to recreate it as a symlink on extraction."""
+    info = zipfile.ZipInfo(arc)
+    info.create_system = 3  # Unix
+    info.external_attr = (stat.S_IFLNK | 0o755) << 16
+    zf.writestr(info, os.readlink(abs_path))
+
+
 def package(dest: str, asset_name: str) -> None:
     os.makedirs(os.path.join(ROOT, "dist"), exist_ok=True)
     zip_path = os.path.join(ROOT, "dist", f"{asset_name}.zip")
@@ -311,11 +322,25 @@ def package(dest: str, asset_name: str) -> None:
     if os.path.exists(zip_path):
         os.remove(zip_path)
     with zipfile.ZipFile(zip_path, "w", zipfile.ZIP_DEFLATED) as zf:
-        for folder, _dirs, files in os.walk(dest):
+        for folder, dirs, files in os.walk(dest):
+            # Store symlinks AS symlinks. git installs its ~145 builtins
+            # (git-add, git-worktree, ...) as symlinks to `git` when built with
+            # NO_INSTALL_HARDLINKS; zipfile.write() would dereference them and
+            # write ~145 full copies of the git binary (~500 MB). Recording them
+            # as symlink entries keeps the archive ~15 MB and the extracted tree
+            # relocatable -- matching the on-disk install (and AP1's git layout).
+            for name in list(dirs):
+                abs_path = os.path.join(folder, name)
+                if os.path.islink(abs_path):
+                    _zip_symlink(zf, abs_path, os.path.relpath(abs_path, dest))
+                    dirs.remove(name)  # recorded as a symlink; don't descend
             for name in files:
                 abs_path = os.path.join(folder, name)
                 arc = os.path.relpath(abs_path, dest)
-                zf.write(abs_path, arc)
+                if os.path.islink(abs_path):
+                    _zip_symlink(zf, abs_path, arc)
+                else:
+                    zf.write(abs_path, arc)
     digest = _sha256(zip_path)
     # newline="\n": keep an LF-only sidecar so `sha256sum -c` works for consumers
     # (text mode would write CRLF on Windows and break filename matching).
