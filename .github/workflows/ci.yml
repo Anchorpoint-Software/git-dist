@@ -20,13 +20,12 @@ jobs:
           - { goos: windows, goarch: amd64 }
           - { goos: darwin, goarch: arm64 }
           - { goos: darwin, goarch: amd64 }
+          - { goos: linux, goarch: amd64 }
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
         with:
           submodules: recursive
-          # PAT with read access to the private git-lfs fork.
-          token: ${{ secrets.SUBMODULE_TOKEN }}
       - uses: actions/setup-go@v5
         with:
           go-version-file: third_party/git-lfs/go.mod

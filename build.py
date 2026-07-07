@@ -3,11 +3,14 @@
 
 Windows -> MinGit (built from the Git for Windows SDK) + the fork's git-lfs.exe.
 macOS   -> git built from source (arm64 or x86_64) + the fork's git-lfs.
+Linux   -> git built from source (x64 or arm64) + the fork's git-lfs.
 
 The fork's git-lfs binary is dropped into the distribution's libexec/git-core/
 so that `git lfs ...` resolves to it via GIT_EXEC_PATH. The result is staged
-under dist/<platform>/ and, with --package, zipped to dist/git-<os>-<arch>.zip
-plus a .sha256 sidecar for publishing as a GitHub release asset.
+under dist/<platform>/ and, with --package, archived to
+dist/git-<os>-<arch>.zip (Windows/macOS) or .tar.gz (Linux — GNU tar can't
+read zips, and consumers extract with the platform tar) plus a .sha256
+sidecar for publishing as a GitHub release asset.
 
 Adapted from Anchorpoint's earlier desktop Git build pipeline.
 Differences: config/env-driven (no interactive prompts), output goes to the
@@ -235,6 +238,37 @@ DESTDIR="{dest}" make strip install prefix=/ \\
 
 
 # --------------------------------------------------------------------------- #
+# Git (Linux: from source)
+# --------------------------------------------------------------------------- #
+def build_git_linux(git_source: str, dest: str) -> None:
+    print("Building Git for Linux")
+
+    _run(["make", "clean"], cwd=git_source)
+    # Same portable-build shape as macOS. RUNTIME_PREFIX resolves
+    # gitexecdir/templates relative to the binary at runtime (config.mak.uname
+    # wires /proc/self/exe for Linux) so the dist works from any extraction
+    # path. SKIP_DASHED_BUILT_INS / NO_INSTALL_HARDLINKS: see the macOS
+    # rationale above — keeps libexec/git-core to the real helper programs.
+    # Needs: gcc/make, libcurl4-openssl-dev, zlib1g-dev, libexpat1-dev, gettext.
+    script = f"""#!/bin/bash
+set -e
+DESTDIR="{dest}" make strip install prefix=/ \\
+  CFLAGS="-O3 -DNDEBUG" \\
+  NO_PERL=1 NO_TCLTK=1 NO_GETTEXT=1 \\
+  NO_INSTALL_HARDLINKS=1 \\
+  SKIP_DASHED_BUILT_INS=YesPlease \\
+  RUNTIME_PREFIX=YesPlease
+"""
+    script_path = os.path.join(ROOT, "build-temp", "git_build.sh")
+    os.makedirs(os.path.dirname(script_path), exist_ok=True)
+    with open(script_path, "w") as f:
+        f.write(script)
+    os.chmod(script_path, 0o755)
+    if _run(["bash", script_path], cwd=git_source) != 0:
+        raise SystemExit("[git-dist] git build failed")
+
+
+# --------------------------------------------------------------------------- #
 # Distribution hygiene + config
 # --------------------------------------------------------------------------- #
 def prune_programs(dest: str) -> None:
@@ -270,6 +304,11 @@ def patch_git_config(dest: str) -> None:
         ("http.schannelUseSSLCAInfo", "false"),
         ("credential.https://dev.azure.com.useHttpPath", "true"),
     ]
+    if platform.system() == "Linux":
+        # OpenSSL-linked build: the schannel keys are Windows-only and an
+        # unsupported sslBackend makes every https operation fail outright.
+        # The system CA bundle is found via the usual OpenSSL defaults.
+        pairs = [(k, v) for (k, v) in pairs if not k.startswith("http.")]
     for key, value in pairs:
         _run(["git", "config", "--file", system_config, key, value])
     _run(["git", "config", "--file", system_config, "--unset", "http.sslCAInfo"])
@@ -324,7 +363,29 @@ def _zip_symlink(zf, abs_path: str, arc: str) -> None:
     zf.writestr(info, os.readlink(abs_path))
 
 
+def package_targz(dest: str, asset_name: str) -> None:
+    """Linux archive. tar preserves symlinks and exec bits natively, and the
+    consumer side (GNU tar) can't read zips — mirrors 3d-tools' convention of
+    zip on Windows, tar.gz elsewhere."""
+    import tarfile
+    os.makedirs(os.path.join(ROOT, "dist"), exist_ok=True)
+    tar_path = os.path.join(ROOT, "dist", f"{asset_name}.tar.gz")
+    print(f"Packaging {dest} -> {tar_path}")
+    if os.path.exists(tar_path):
+        os.remove(tar_path)
+    with tarfile.open(tar_path, "w:gz") as tf:
+        for entry in sorted(os.listdir(dest)):
+            tf.add(os.path.join(dest, entry), arcname=entry)
+    digest = _sha256(tar_path)
+    with open(tar_path + ".sha256", "w", newline="\n") as f:
+        f.write(f"{digest}  {asset_name}.tar.gz\n")
+    print(f"sha256 {digest}")
+
+
 def package(dest: str, asset_name: str) -> None:
+    if platform.system() == "Linux":
+        package_targz(dest, asset_name)
+        return
     os.makedirs(os.path.join(ROOT, "dist"), exist_ok=True)
     zip_path = os.path.join(ROOT, "dist", f"{asset_name}.zip")
     print(f"Packaging {dest} -> {zip_path}")
@@ -412,9 +473,10 @@ def compute_tag(dest: str, bump: bool) -> str:
 
 
 def publish(tag: str, asset: str) -> None:
+    ext = "tar.gz" if platform.system() == "Linux" else "zip"
     files = [
-        os.path.join(ROOT, "dist", f"{asset}.zip"),
-        os.path.join(ROOT, "dist", f"{asset}.zip.sha256"),
+        os.path.join(ROOT, "dist", f"{asset}.{ext}"),
+        os.path.join(ROOT, "dist", f"{asset}.{ext}.sha256"),
     ]
     for f in files:
         if not os.path.exists(f):
@@ -453,7 +515,8 @@ def fresh_dest(asset_name: str) -> str:
 def asset_name_for(arch: str) -> str:
     if platform.system() == "Windows":
         return "git-windows-x64"
-    return f"git-macos-{'arm64' if arch == 'arm64' else 'x64'}"
+    prefix = "git-linux" if platform.system() == "Linux" else "git-macos"
+    return f"{prefix}-{'arm64' if arch == 'arm64' else 'x64'}"
 
 
 def _executables(dest: str):
@@ -581,8 +644,12 @@ def main() -> None:
         git_source = resolve_path(config, "gitsource", "GIT_SOURCE_PATH", required=True)
         build_git_macos(git_source, dest, arch)
         build_gitlfs(gitlfs, dest, goos="darwin", goarch="amd64" if arch == "x86_64" else "arm64")
+    elif platform.system() == "Linux":
+        git_source = resolve_path(config, "gitsource", "GIT_SOURCE_PATH", required=True)
+        build_git_linux(git_source, dest)
+        build_gitlfs(gitlfs, dest, goos="linux", goarch="amd64" if arch == "x86_64" else "arm64")
     else:
-        raise SystemExit("[git-dist] unsupported platform (Windows and macOS only)")
+        raise SystemExit("[git-dist] unsupported platform (Windows, macOS, and Linux only)")
 
     prune_programs(dest)
     patch_git_config(dest)
