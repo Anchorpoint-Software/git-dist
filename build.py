@@ -327,7 +327,8 @@ def build_git_linux(git_source: str, dest: str) -> None:
     # wires /proc/self/exe for Linux) so the dist works from any extraction
     # path. SKIP_DASHED_BUILT_INS / NO_INSTALL_HARDLINKS: see the macOS
     # rationale above — keeps libexec/git-core to the real helper programs.
-    # Needs: gcc/make, libcurl4-openssl-dev, zlib1g-dev, libexpat1-dev, gettext.
+    # Needs: gcc/make, libssl-dev, libcurl4-openssl-dev, zlib1g-dev,
+    # libexpat1-dev, gettext.
     script = f"""#!/bin/bash
 set -e
 DESTDIR="{dest}" make strip install prefix=/ \\

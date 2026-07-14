@@ -71,7 +71,7 @@ One-time per machine (not per release):
   build-extra sources are fetched automatically on the first build.
 - **macOS** — install Go and Xcode command-line tools, and check out `git/git`
   at the target tag; set `[gitsource].path`.
-- **Linux** — install Go plus `gcc`/`make`, `libcurl4-openssl-dev`,
+- **Linux** — install Go plus `gcc`/`make`, `libssl-dev`, `libcurl4-openssl-dev`,
   `zlib1g-dev`, `libexpat1-dev`, and `gettext`; check out `git/git` at the
   target tag and set `[gitsource].path`.
 
