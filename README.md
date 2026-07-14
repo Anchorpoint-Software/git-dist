@@ -1,7 +1,8 @@
 # git-dist
 
-Builds a portable Git distribution for Windows and macOS, bundled with
-[Anchorpoint's `git-lfs` fork](https://github.com/Anchorpoint-Software/git-lfs),
+Builds a portable Git distribution for Windows, macOS, and Linux, bundled with
+[Anchorpoint's `git-lfs` fork](https://github.com/Anchorpoint-Software/git-lfs)
+and [Git Credential Manager](https://github.com/git-ecosystem/git-credential-manager),
 and publishes the per-OS archives as GitHub release assets.
 
 Anchorpoint ships its own Git rather than relying on the user's system Git. The
@@ -11,23 +12,34 @@ in the repo. Stock `git-lfs` lacks `--stdin`, so the fork ships with Anchorpoint
 
 ## Release assets
 
-Each release tag attaches three signed archives, each with a `.sha256`:
+Each release tag attaches these archives (signed on Windows/macOS), each with a
+`.sha256`:
 
 | Asset | Platform |
 |-------|----------|
 | `git-windows-x64.zip` | Windows x64 (MinGit) |
 | `git-macos-arm64.zip` | macOS Apple Silicon |
 | `git-macos-x64.zip`   | macOS Intel |
+| `git-linux-x64.tar.gz` | Linux x64 |
 
 Each is a self-contained Git tree with the fork's `git-lfs` in
 `libexec/git-core/`, so `git lfs version` reports `Anchorpoint`.
 
+Credential handling matches across platforms: MinGit ships GCM on Windows; on
+macOS/Linux the pinned official GCM release (`GCM_VERSION`/`GCM_SHA256` in
+`build.py`) is bundled under `gcm/` and wired through a baked `etc/gitconfig`
+(`credential.helper = manager`, plus the lfs filter block that MinGit's
+gitconfig already carries). On Linux the store defaults to the freedesktop
+Secret Service (`credential.credentialStore = secretservice`, i.e. the
+GNOME/KDE keyrings); override with `GCM_CREDENTIAL_STORE` on headless setups.
+
 ## Layout
 
 ```
-build.py             # git + fork git-lfs -> dist/<asset>/ -> zip + .sha256
+build.py             # git + fork git-lfs + GCM -> dist/<asset>/ -> zip + .sha256
 release.ps1          # Windows one-command release (checks SimplySign, runs build.py)
 sign-windows.ps1     # signs the dist's .exe/.dll via signtool (SimplySign cert)
+gcm-entitlements.plist   # hardened-runtime JIT entitlements for re-signing GCM (macOS)
 config.example.ini   # copy to config.ini; host-specific paths + signing
 third_party/git-lfs/ # submodule -> the git-lfs fork
 .github/workflows/ci.yml   # compile-checks the fork (no sign/publish)
@@ -59,6 +71,9 @@ One-time per machine (not per release):
   build-extra sources are fetched automatically on the first build.
 - **macOS** — install Go and Xcode command-line tools, and check out `git/git`
   at the target tag; set `[gitsource].path`.
+- **Linux** — install Go plus `gcc`/`make`, `libcurl4-openssl-dev`,
+  `zlib1g-dev`, `libexpat1-dev`, and `gettext`; check out `git/git` at the
+  target tag and set `[gitsource].path`.
 
 Signing is config/env-driven and a no-op when unset: macOS uses
 `MACOS_SIGN_IDENTITY`; Windows uses `sign-windows.ps1` with the
@@ -82,6 +97,9 @@ python build.py --package --arch arm64  --publish
 xcrun notarytool submit dist/git-macos-arm64.zip --keychain-profile <profile> --wait
 python build.py --package --arch x86_64 --publish
 xcrun notarytool submit dist/git-macos-x64.zip --keychain-profile <profile> --wait
+
+# Linux — unsigned; builds and uploads into the same tag:
+python build.py --package --publish
 ```
 
 `--publish` auto-derives the tag `v<gitversion>.anchorpoint.<n>` (GfW-style, like

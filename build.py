@@ -2,11 +2,14 @@
 """Build a portable Git distribution bundled with Anchorpoint's git-lfs fork.
 
 Windows -> MinGit (built from the Git for Windows SDK) + the fork's git-lfs.exe.
-macOS   -> git built from source (arm64 or x86_64) + the fork's git-lfs.
-Linux   -> git built from source (x64 or arm64) + the fork's git-lfs.
+macOS   -> git built from source (arm64 or x86_64) + the fork's git-lfs + GCM.
+Linux   -> git built from source (x64 or arm64) + the fork's git-lfs + GCM.
 
 The fork's git-lfs binary is dropped into the distribution's libexec/git-core/
-so that `git lfs ...` resolves to it via GIT_EXEC_PATH. The result is staged
+so that `git lfs ...` resolves to it via GIT_EXEC_PATH. On macOS/Linux the
+pinned Git Credential Manager release is bundled under gcm/ and wired via a
+baked etc/gitconfig (`credential.helper = manager`) — MinGit already ships GCM
+on Windows. The result is staged
 under dist/<platform>/ and, with --package, archived to
 dist/git-<os>-<arch>.zip (Windows/macOS) or .tar.gz (Linux — GNU tar can't
 read zips, and consumers extract with the platform tar) plus a .sha256
@@ -35,12 +38,15 @@ import os
 import platform
 import shutil
 import stat
+import tarfile
+import urllib.request
 import zipfile
 
 ROOT = os.path.dirname(os.path.realpath(__file__))
 MACOSX_DEPLOYMENT_TARGET = "12.0"
 
-# Server-side and unsupported programs we never ship.
+# Server-side and unsupported programs we never ship. Entries are tried under
+# <dest> and <dest>/mingw64, bare and with .exe (see prune_programs).
 PRUNE_PROGRAMS = [
     "bin/git-cvsserver",
     "bin/git-receive-pack",
@@ -49,7 +55,22 @@ PRUNE_PROGRAMS = [
     "bin/git-shell",
     "libexec/git-core/git-svn",
     "libexec/git-core/git-p4",
+    # Legacy Windows credential helper superseded by GCM; MinGit drops a copy
+    # in both bin/ and libexec/git-core/.
+    "bin/git-credential-wincred",
+    "libexec/git-core/git-credential-wincred",
 ]
+
+# Git Credential Manager, bundled on macOS/Linux (MinGit already ships GCM on
+# Windows). Official self-contained release tarballs from
+# git-ecosystem/git-credential-manager, pinned by version + per-asset sha256.
+GCM_VERSION = "2.8.0"
+GCM_SHA256 = {
+    "osx-arm64": "a61399385e861b8e6e896d04e528eebe1214e002edbb98373e5a458dee194d56",
+    "osx-x64": "bba2b1a20198b2a1a69496a7cd81f4cb23f569fcc7d17751a8a93c071bb6a2b9",
+    "linux-arm64": "6e1782b351eec3399db43699ff4fe2a1bf576654310ee4580aa4867705c0bc08",
+    "linux-x64": "6040c849b428a4e5b78594fd4fd2819fc3ea4ca472c13580b65a486bef9df21d",
+}
 
 
 # --------------------------------------------------------------------------- #
@@ -104,6 +125,63 @@ def build_gitlfs(gitlfs: str, dest: str, goos: str, goarch: str) -> None:
     if goos != "windows":
         os.chmod(target, 0o755)
     print(f"git-lfs installed at {target}")
+
+
+# --------------------------------------------------------------------------- #
+# Git Credential Manager (macOS/Linux; Windows gets GCM via MinGit)
+# --------------------------------------------------------------------------- #
+def bundle_gcm(dest: str, arch: str) -> None:
+    """Bundle the official GCM release so `credential.helper = manager` works.
+
+    Downloads the pinned self-contained tarball (sha256-verified, cached in
+    build-temp/), extracts it to <dest>/gcm/, and installs a small sh shim at
+    libexec/git-core/git-credential-manager. git prepends GIT_EXEC_PATH to a
+    helper's PATH, so the shim resolves exactly like the bundled git-lfs.
+    A shim rather than a symlink or moving the files into git-core: the macOS
+    tarball is a ~200-file .NET layout that must stay next to its apphost, and
+    the apphost misresolves its .dll when the executable path is a symlink.
+    """
+    plat = "osx" if platform.system() == "Darwin" else "linux"
+    key = f"{plat}-{'arm64' if arch == 'arm64' else 'x64'}"
+    asset = f"gcm-{key}-{GCM_VERSION}.tar.gz"
+    want = GCM_SHA256[key]
+
+    cache = os.path.join(ROOT, "build-temp", asset)
+    if not (os.path.exists(cache) and _sha256(cache) == want):
+        url = (
+            "https://github.com/git-ecosystem/git-credential-manager/"
+            f"releases/download/v{GCM_VERSION}/{asset}"
+        )
+        print(f"Downloading {url}")
+        os.makedirs(os.path.dirname(cache), exist_ok=True)
+        urllib.request.urlretrieve(url, cache)
+        got = _sha256(cache)
+        if got != want:
+            raise SystemExit(
+                f"[git-dist] sha256 mismatch for {asset}\n"
+                f"  expected {want}\n  got      {got}"
+            )
+
+    gcm_dir = os.path.join(dest, "gcm")
+    shutil.rmtree(gcm_dir, ignore_errors=True)
+    os.makedirs(gcm_dir)
+    with tarfile.open(cache, "r:gz") as tf:
+        try:
+            tf.extractall(gcm_dir, filter="data")
+        except TypeError:  # Python < 3.12: no extraction filters
+            tf.extractall(gcm_dir)
+    # GCM's own uninstaller doesn't apply to a bundled tree.
+    uninstall = os.path.join(gcm_dir, "uninstall.sh")
+    if os.path.exists(uninstall):
+        os.remove(uninstall)
+    os.chmod(os.path.join(gcm_dir, "git-credential-manager"), 0o755)
+
+    shim = os.path.join(git_core_dir(dest), "git-credential-manager")
+    os.makedirs(os.path.dirname(shim), exist_ok=True)
+    with open(shim, "w", newline="\n") as f:
+        f.write('#!/bin/sh\nexec "$(dirname "$0")/../../gcm/git-credential-manager" "$@"\n')
+    os.chmod(shim, 0o755)
+    print(f"GCM {GCM_VERSION} installed at {gcm_dir}")
 
 
 # --------------------------------------------------------------------------- #
@@ -285,42 +363,62 @@ def prune_programs(dest: str) -> None:
 def patch_git_config(dest: str) -> None:
     """Bake the system-level config the app relies on into the bundled gitconfig.
 
-    Mirrors dugite-native: portable-friendly, schannel TLS on Windows.
+    Windows patches the gitconfig MinGit already ships (portable-friendly,
+    schannel TLS — mirrors dugite-native). The macOS/Linux dists are built from
+    plain git source and ship no gitconfig at all, so create etc/gitconfig —
+    the RUNTIME_PREFIX build reads it relative to the extracted tree — and bake
+    the wiring for the bundled GCM plus the lfs filter (MinGit's gitconfig
+    already carries both on Windows).
     """
-    candidates = [
-        os.path.join(dest, "etc/gitconfig"),
-        os.path.join(dest, "mingw64/etc/gitconfig"),
-    ]
-    system_config = next((c for c in candidates if os.path.exists(c)), None)
-    if not system_config:
-        print("[git-dist] WARNING: no bundled gitconfig found to patch")
-        return
+    if platform.system() == "Windows":
+        candidates = [
+            os.path.join(dest, "etc/gitconfig"),
+            os.path.join(dest, "mingw64/etc/gitconfig"),
+        ]
+        system_config = next((c for c in candidates if os.path.exists(c)), None)
+        if not system_config:
+            print("[git-dist] WARNING: no bundled gitconfig found to patch")
+            return
+        pairs = [
+            ("core.symlinks", "false"),
+            ("core.autocrlf", "true"),
+            ("core.fscache", "true"),
+            ("http.sslBackend", "schannel"),
+            ("http.schannelUseSSLCAInfo", "false"),
+            ("credential.https://dev.azure.com.useHttpPath", "true"),
+        ]
+    else:
+        # Created fresh: only keys that make sense off-Windows (no autocrlf/
+        # symlinks/fscache, no schannel — the OpenSSL/SecureTransport builds
+        # find the CA bundle via their own defaults).
+        system_config = os.path.join(dest, "etc", "gitconfig")
+        os.makedirs(os.path.dirname(system_config), exist_ok=True)
+        pairs = [
+            ("credential.helper", "manager"),
+            ("credential.https://dev.azure.com.useHttpPath", "true"),
+            # What `git lfs install --system` would write; MinGit bakes the
+            # same block on Windows.
+            ("filter.lfs.clean", "git-lfs clean -- %f"),
+            ("filter.lfs.smudge", "git-lfs smudge -- %f"),
+            ("filter.lfs.process", "git-lfs filter-process"),
+            ("filter.lfs.required", "true"),
+        ]
+        if platform.system() == "Linux":
+            # GCM has no default credential store on Linux. Secret Service is
+            # what the GNOME/KDE keyrings implement; unusual setups can
+            # override via GCM_CREDENTIAL_STORE.
+            pairs.append(("credential.credentialStore", "secretservice"))
 
-    pairs = [
-        ("core.symlinks", "false"),
-        ("core.autocrlf", "true"),
-        ("core.fscache", "true"),
-        ("http.sslBackend", "schannel"),
-        ("http.schannelUseSSLCAInfo", "false"),
-        ("credential.https://dev.azure.com.useHttpPath", "true"),
-    ]
-    if platform.system() == "Linux":
-        # OpenSSL-linked build: the schannel keys are Windows-only and an
-        # unsupported sslBackend makes every https operation fail outright.
-        # The system CA bundle is found via the usual OpenSSL defaults.
-        pairs = [(k, v) for (k, v) in pairs if not k.startswith("http.")]
     for key, value in pairs:
         _run(["git", "config", "--file", system_config, key, value])
-    _run(["git", "config", "--file", system_config, "--unset", "http.sslCAInfo"])
-    _run(["git", "config", "--file", system_config, "--remove-section", "include"])
 
-    for rel in ("etc/gitattributes", "mingw64/etc/gitattributes"):
-        p = os.path.join(dest, rel)
-        if os.path.exists(p):
-            os.remove(p)
-    legacy = os.path.join(dest, "mingw64/bin/git-credential-wincred.exe")
-    if os.path.exists(legacy):
-        os.remove(legacy)
+    if platform.system() == "Windows":
+        _run(["git", "config", "--file", system_config, "--unset", "http.sslCAInfo"])
+        _run(["git", "config", "--file", system_config, "--remove-section", "include"])
+        for rel in ("etc/gitattributes", "mingw64/etc/gitattributes"):
+            p = os.path.join(dest, rel)
+            if os.path.exists(p):
+                os.remove(p)
 
 
 # --------------------------------------------------------------------------- #
@@ -332,11 +430,20 @@ def sign(dest: str) -> None:
         if not identity:
             print("[git-dist] WARNING: MACOS_SIGN_IDENTITY unset — skipping signing")
             return
+        entitlements = os.path.join(ROOT, "gcm-entitlements.plist")
         for binary in _executables(dest):
-            _run([
+            cmd = [
                 "codesign", "--deep", "--force", "--verify", "--verbose",
-                "--timestamp", "--options", "runtime", "--sign", identity, binary,
-            ])
+                "--timestamp", "--options", "runtime",
+            ]
+            # GCM's CoreCLR needs JIT entitlements under the hardened runtime
+            # — a re-signed binary without them crashes at startup. Same set
+            # GCM's own release signatures carry (dylibs don't take
+            # entitlements, only the main executables).
+            in_gcm = os.path.basename(os.path.dirname(binary)) == "gcm"
+            if in_gcm and not binary.endswith(".dylib"):
+                cmd += ["--entitlements", entitlements]
+            _run(cmd + ["--sign", identity, binary])
         print("macOS signing complete (notarization happens in CI after packaging)")
     elif platform.system() == "Windows":
         script = os.environ.get("WINDOWS_SIGN_SCRIPT") or os.path.join(ROOT, "sign-windows.ps1")
@@ -367,7 +474,6 @@ def package_targz(dest: str, asset_name: str) -> None:
     """Linux archive. tar preserves symlinks and exec bits natively, and the
     consumer side (GNU tar) can't read zips — mirrors 3d-tools' convention of
     zip on Windows, tar.gz elsewhere."""
-    import tarfile
     os.makedirs(os.path.join(ROOT, "dist"), exist_ok=True)
     tar_path = os.path.join(ROOT, "dist", f"{asset_name}.tar.gz")
     print(f"Packaging {dest} -> {tar_path}")
@@ -528,6 +634,14 @@ def _executables(dest: str):
             p = os.path.join(d, name)
             if os.path.isfile(p) and (os.access(p, os.X_OK) or name.endswith(".dylib")):
                 yield p
+    # The GCM tree needs an explicit allowlist: its ~200 .NET assemblies
+    # (.dll) carry the executable bit but are PE files codesign rejects.
+    # Mach-O files there are the two apphosts and the native .dylibs.
+    gcm = os.path.join(dest, "gcm")
+    if os.path.isdir(gcm):
+        for name in os.listdir(gcm):
+            if name.endswith(".dylib") or name in ("git-credential-manager", "createdump"):
+                yield os.path.join(gcm, name)
 
 
 def _sha256(path: str) -> str:
@@ -644,10 +758,12 @@ def main() -> None:
         git_source = resolve_path(config, "gitsource", "GIT_SOURCE_PATH", required=True)
         build_git_macos(git_source, dest, arch)
         build_gitlfs(gitlfs, dest, goos="darwin", goarch="amd64" if arch == "x86_64" else "arm64")
+        bundle_gcm(dest, arch)
     elif platform.system() == "Linux":
         git_source = resolve_path(config, "gitsource", "GIT_SOURCE_PATH", required=True)
         build_git_linux(git_source, dest)
         build_gitlfs(gitlfs, dest, goos="linux", goarch="amd64" if arch == "x86_64" else "arm64")
+        bundle_gcm(dest, arch)
     else:
         raise SystemExit("[git-dist] unsupported platform (Windows, macOS, and Linux only)")
 
