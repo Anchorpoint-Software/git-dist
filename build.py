@@ -174,6 +174,14 @@ def bundle_gcm(dest: str, arch: str) -> None:
     uninstall = os.path.join(gcm_dir, "uninstall.sh")
     if os.path.exists(uninstall):
         os.remove(uninstall)
+    # The tarball carries NOTICE but not the MIT text it refers to. Anchorpoint
+    # generates its third-party notices from this tree, so fetch the licence
+    # from the same tag rather than shipping a NOTICE with nothing behind it.
+    license_url = (
+        "https://raw.githubusercontent.com/git-ecosystem/"
+        f"git-credential-manager/v{GCM_VERSION}/LICENSE"
+    )
+    urllib.request.urlretrieve(license_url, os.path.join(gcm_dir, "LICENSE"))
     os.chmod(os.path.join(gcm_dir, "git-credential-manager"), 0o755)
 
     shim = os.path.join(git_core_dir(dest), "git-credential-manager")
@@ -345,6 +353,21 @@ DESTDIR="{dest}" make strip install prefix=/ \\
     os.chmod(script_path, 0o755)
     if _run(["bash", script_path], cwd=git_source) != 0:
         raise SystemExit("[git-dist] git build failed")
+
+
+def install_git_license(git_source: str, dest: str) -> None:
+    """Install git's own licence text next to the binaries.
+
+    `make install` does not ship COPYING. On Windows the question never arises:
+    build_git_windows unpacks the Git SDK, which already carries LICENSE.txt and
+    a share/licenses tree for the MSYS2 DLLs it bundles. The macOS and Linux
+    builds link system libraries instead, so git's own terms are the whole set.
+    """
+    src = os.path.join(git_source, "COPYING")
+    if not os.path.exists(src):
+        raise SystemExit(f"[git-dist] COPYING not found in {git_source}")
+    shutil.copy2(src, os.path.join(dest, "LICENSE.txt"))
+    print(f"Git licence installed at {os.path.join(dest, 'LICENSE.txt')}")
 
 
 # --------------------------------------------------------------------------- #
@@ -758,11 +781,13 @@ def main() -> None:
     elif platform.system() == "Darwin":
         git_source = resolve_path(config, "gitsource", "GIT_SOURCE_PATH", required=True)
         build_git_macos(git_source, dest, arch)
+        install_git_license(git_source, dest)
         build_gitlfs(gitlfs, dest, goos="darwin", goarch="amd64" if arch == "x86_64" else "arm64")
         bundle_gcm(dest, arch)
     elif platform.system() == "Linux":
         git_source = resolve_path(config, "gitsource", "GIT_SOURCE_PATH", required=True)
         build_git_linux(git_source, dest)
+        install_git_license(git_source, dest)
         build_gitlfs(gitlfs, dest, goos="linux", goarch="amd64" if arch == "x86_64" else "arm64")
         bundle_gcm(dest, arch)
     else:
